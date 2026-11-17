@@ -1,1 +1,1 @@
-Build a terminal emulator for myself.
+My custom terminal
