@@ -23,8 +23,21 @@ ScrollBar main_scrollbar;
 GC main_gc = 0;
 XftFont *main_font = NULL;
 
+// shared with the event handlers, which only get the XEvent
+static int pty_fd = -1;
+static int needs_redraw = 0;
+
+static void expose(XEvent *);
+static void configure(XEvent *);
+static void bpress(XEvent *);
+static void kpress(XEvent *);
+
+// X event type -> handler; unlisted events are ignored
 static void (*handler[LASTEvent]) (XEvent *) = {
-  [ConfigureNotify] = screen_resize_handler
+  [Expose] = expose,
+  [ConfigureNotify] = configure,
+  [ButtonPress] = bpress,
+  [KeyPress] = kpress,
 };
 
 void create_window() {
@@ -127,6 +140,62 @@ static int encode_cursor_key(KeySym sym, unsigned int state, char *out,
   return 0;
 }
 
+static void expose(XEvent *e) { needs_redraw = 1; }
+
+static void configure(XEvent *e) {
+  screen_resize_handler(e);
+  needs_redraw = 1;
+}
+
+// wheel: button 4 scrolls back, button 5 forward
+static void bpress(XEvent *e) {
+  if (e->xbutton.button == Button4) {
+    screen_scroll(SCROLL_LINES);
+    needs_redraw = 1;
+  } else if (e->xbutton.button == Button5) {
+    screen_scroll(-SCROLL_LINES);
+    needs_redraw = 1;
+  }
+}
+
+static void kpress(XEvent *e) {
+  char buf[32] = {0};
+  KeySym keysym;
+  int count = XLookupString(&e->xkey, buf, sizeof(buf), &keysym, NULL);
+  // Shift+PgUp/PgDn scroll history by a page, not sent to the pty
+  if ((e->xkey.state & ShiftMask) &&
+      (keysym == XK_Prior || keysym == XK_Next)) {
+    int rows, cols;
+    screen_view_size(&rows, &cols);
+    screen_scroll(keysym == XK_Prior ? rows : -rows);
+    needs_redraw = 1;
+    return;
+  }
+  char seq[16];
+  int seq_len = encode_cursor_key(keysym, e->xkey.state, seq, sizeof(seq));
+  if (seq_len > 0) {
+    // input to the pty returns the view to the live screen
+    screen_scroll(-HIST_SIZE);
+    needs_redraw = 1;
+    write(pty_fd, seq, seq_len);
+    return;
+  }
+  if (keysym == XK_Return) {
+    buf[0] = '\r';
+    count = 1;
+  } else if (keysym == XK_BackSpace) {
+    buf[0] = 0x7f;
+    count = 1;
+  }
+  if (count > 0) {
+    screen_scroll(-HIST_SIZE);
+    needs_redraw = 1;
+    if (e->xkey.state & Mod1Mask)
+      write(pty_fd, "\033", 1);
+    write(pty_fd, buf, count);
+  }
+}
+
 int main() {
   create_window();
   XSelectInput(main_display, main_window,
@@ -141,7 +210,6 @@ int main() {
   ws.ws_col = vcols;
   ws.ws_xpixel = SCREEN_WIDTH;
   ws.ws_ypixel = SCREEN_HEIGHT;
-  int pty_fd = -1;
   if (pty_fork(&pty_fd, &ws) < 0) {
     fprintf(stderr, "Error: failed to start PTY\n");
     return 1;
@@ -164,7 +232,7 @@ int main() {
       break;
     }
 
-    int needs_redraw = 0;
+    needs_redraw = 0;
     if (FD_ISSET(pty_fd, &rfds)) {
       char buf[4096];
       int n = (int)read(pty_fd, buf, sizeof(buf));
@@ -183,58 +251,8 @@ int main() {
       while (XPending(main_display)) {
         XEvent e;
         XNextEvent(main_display, &e);
-        if (e.type == Expose) {
-          needs_redraw = 1;
-        } else if (e.type == ConfigureNotify) {
+        if (handler[e.type])
           (handler[e.type])(&e);
-          needs_redraw = 1;
-        } else if (e.type == ButtonPress) {
-          // wheel: button 4 scrolls back, button 5 forward
-          if (e.xbutton.button == Button4) {
-            screen_scroll(SCROLL_LINES);
-            needs_redraw = 1;
-          } else if (e.xbutton.button == Button5) {
-            screen_scroll(-SCROLL_LINES);
-            needs_redraw = 1;
-          }
-        } else if (e.type == KeyPress) {
-          char buf[32] = {0};
-          KeySym keysym;
-          int count = XLookupString(&e.xkey, buf, sizeof(buf), &keysym, NULL);
-          // Shift+PgUp/PgDn scroll history by a page, not sent to the pty
-          if ((e.xkey.state & ShiftMask) &&
-              (keysym == XK_Prior || keysym == XK_Next)) {
-            int rows, cols;
-            screen_view_size(&rows, &cols);
-            screen_scroll(keysym == XK_Prior ? rows : -rows);
-            needs_redraw = 1;
-            continue;
-          }
-          char seq[16];
-          int seq_len =
-              encode_cursor_key(keysym, e.xkey.state, seq, sizeof(seq));
-          if (seq_len > 0) {
-            // input to the pty returns the view to the live screen
-            screen_scroll(-HIST_SIZE);
-            needs_redraw = 1;
-            write(pty_fd, seq, seq_len);
-            continue;
-          }
-          if (keysym == XK_Return) {
-            buf[0] = '\r';
-            count = 1;
-          } else if (keysym == XK_BackSpace) {
-            buf[0] = 0x7f;
-            count = 1;
-          }
-          if (count > 0) {
-            screen_scroll(-HIST_SIZE);
-            needs_redraw = 1;
-            if (e.xkey.state & Mod1Mask)
-              write(pty_fd, "\033", 1);
-            write(pty_fd, buf, count);
-          }
-        }
       }
     }
 
