@@ -19,13 +19,15 @@ static TermScreen screen;
 
 // scrollback: ring of lines that scrolled off the top of the screen
 static text_t *hist[HIST_SIZE];
+static char hist_wrap[HIST_SIZE]; // soft-wrap flag per line, as buf_wrap
 static int hist_head = 0; // slot the next line goes into
 static int hist_len = 0;  // lines stored, at most HIST_SIZE
 
 // store line as the newest history entry; returns a spare line for reuse
-static text_t *hist_push(text_t *line) {
+static text_t *hist_push(text_t *line, char wrap) {
   text_t *spare = hist[hist_head];
   hist[hist_head] = line;
+  hist_wrap[hist_head] = wrap;
   hist_head = (hist_head + 1) % HIST_SIZE;
   if (hist_len < HIST_SIZE)
     hist_len++;
@@ -97,6 +99,7 @@ void screen_init(Display *display, Window window, TextCursor cursor, GC gc, XftF
     screen.buf_text[i] = malloc(screen.buf_cols * sizeof(text_t));
     memset(screen.buf_text[i], ' ', screen.buf_cols);
   }
+  screen.buf_wrap = calloc(screen.buf_rows, sizeof(char));
 }
 
 
@@ -312,6 +315,9 @@ static void erase_cells(int row, int from, int to) {
     to = screen.view_cols;
   for (int i = from; i < to; i++)
     screen.buf_text[row][i] = ' ';
+  // erasing to the end of the row ends the line there
+  if (to == screen.view_cols)
+    screen.buf_wrap[row] = 0;
 }
 
 // move the cursor, clamped to the visible screen; cancels a pending wrap
@@ -337,7 +343,9 @@ static void scroll_up(int top, int bot, int n) {
     text_t *line = screen.buf_text[top];
     memmove(&screen.buf_text[top], &screen.buf_text[top + 1],
             (bot - top) * sizeof(text_t *));
+    memmove(&screen.buf_wrap[top], &screen.buf_wrap[top + 1], bot - top);
     screen.buf_text[bot] = line;
+    screen.buf_wrap[bot] = 0;
     memset(line, ' ', screen.buf_cols);
   }
 }
@@ -350,7 +358,9 @@ static void scroll_down(int top, int bot, int n) {
     text_t *line = screen.buf_text[bot];
     memmove(&screen.buf_text[top + 1], &screen.buf_text[top],
             (bot - top) * sizeof(text_t *));
+    memmove(&screen.buf_wrap[top + 1], &screen.buf_wrap[top], bot - top);
     screen.buf_text[top] = line;
+    screen.buf_wrap[top] = 0;
     memset(line, ' ', screen.buf_cols);
   }
 }
@@ -361,7 +371,7 @@ static void linefeed(TextCursor *cursor) {
     // the top line leaves the screen only when the region starts at row 0;
     // keep it in history and rotate a spare line in to be blanked
     if (screen.scroll_top == 0)
-      screen.buf_text[0] = hist_push(screen.buf_text[0]);
+      screen.buf_text[0] = hist_push(screen.buf_text[0], screen.buf_wrap[0]);
     scroll_up(screen.scroll_top, screen.scroll_bot, 1);
   } else
     move_to(cursor, cursor->row + 1, cursor->col);
@@ -642,6 +652,8 @@ static void handle_control(TextCursor *cursor, unsigned char c) {
 // write a char at the cursor, wrapping first if the last write hit the edge
 static void put_printable(TextCursor *cursor, text_t c) {
   if (wrap_next) {
+    // mark the row as continued so resize can join it back
+    screen.buf_wrap[cursor->row] = 1;
     move_to(cursor, cursor->row, 0);
     linefeed(cursor);
   }
@@ -722,48 +734,138 @@ void screen_view_size(int *rows, int *cols) {
   *rows = screen.view_rows;
   *cols = screen.view_cols;
 }
-void tresize(int row, int col) {
-  // add white spaces
-  if (col > screen.buf_cols) {
-    for (int i = 0; i < screen.buf_rows; ++i) {
-      screen.buf_text[i] =
-          realloc(screen.buf_text[i], col * sizeof(text_t));
-      memset(&screen.buf_text[i][screen.buf_cols], ' ', 
-          col - screen.buf_cols);
-    }
-    // widen history lines too, they get reused as screen rows
-    for (int i = 0; i < HIST_SIZE; ++i) {
-      if (hist[i] == NULL)
-        continue;
-      hist[i] = realloc(hist[i], col * sizeof(text_t));
-      memset(&hist[i][screen.buf_cols], ' ', col - screen.buf_cols);
-    }
-    screen.buf_cols = col;
+// row i of history followed by the screen, oldest first
+static text_t *src_row(int i, char *wrap) {
+  if (i < hist_len) {
+    int k = (hist_head - hist_len + i + HIST_SIZE) % HIST_SIZE;
+    *wrap = hist_wrap[k];
+    return hist[k];
   }
-  if (row > screen.buf_rows) {
-    screen.buf_text = realloc(screen.buf_text, row * sizeof(text_t *));
-    for (int i = screen.buf_rows; i < row; ++i) {
-      screen.buf_text[i] = malloc(screen.buf_cols * sizeof(text_t));
-      memset(screen.buf_text[i], ' ', screen.buf_cols);
-    }
-    screen.buf_rows = row;
-  }
+  *wrap = screen.buf_wrap[i - hist_len];
+  return screen.buf_text[i - hist_len];
+}
 
+// screen row holds only blanks and doesn't continue on the next row
+static int row_blank(int r) {
+  if (screen.buf_wrap[r])
+    return 0;
+  for (int i = 0; i < screen.view_cols; i++)
+    if (screen.buf_text[r][i] != ' ')
+      return 0;
+  return 1;
+}
+
+// reflow: join soft-wrapped rows of history + screen into logical lines and
+// cut them again at the new width; the cursor stays on the same char, rows
+// above the new screen go to history
+void tresize(int row, int col) {
+  TextCursor *cursor = &screen.cursor;
+  int old_cols = screen.view_cols;
+  // skip blank rows below the cursor so shrinking doesn't push them to history
+  int last = screen.view_rows - 1;
+  while (last > cursor->row && row_blank(last))
+    last--;
+  int nsrc = hist_len + last + 1;
+  int cur_src = hist_len + cursor->row;
+
+  text_t **out = NULL; // rewrapped rows, oldest first
+  char *out_wrap = NULL;
+  int nout = 0, cap = 0;
+  text_t *lbuf = NULL; // one logical line
+  int lcap = 0;
+  int cur_row = 0, cur_col = 0;
+  for (int i = 0; i < nsrc;) {
+    // gather rows until one that isn't soft-wrapped
+    int len = 0, cur_off = -1;
+    char wrap;
+    do {
+      text_t *src = src_row(i, &wrap);
+      if (len + old_cols > lcap) {
+        lcap = (len + old_cols) * 2;
+        lbuf = realloc(lbuf, lcap * sizeof(text_t));
+      }
+      memcpy(&lbuf[len], src, old_cols * sizeof(text_t));
+      if (i == cur_src)
+        cur_off = len + cursor->col;
+      len += old_cols;
+      i++;
+    } while (wrap && i < nsrc);
+    // trailing blanks don't need rows, but the cursor's cell does
+    while (len > 0 && lbuf[len - 1] == ' ')
+      len--;
+    if (cur_off >= len)
+      len = cur_off + 1;
+    if (cur_off >= 0) {
+      cur_row = nout + cur_off / col;
+      cur_col = cur_off % col;
+    }
+    // cut into rows of the new width; an empty line still takes one row
+    int nrows = len > 0 ? (len + col - 1) / col : 1;
+    for (int r = 0; r < nrows; r++) {
+      if (nout == cap) {
+        cap = cap ? cap * 2 : 64;
+        out = realloc(out, cap * sizeof(text_t *));
+        out_wrap = realloc(out_wrap, cap * sizeof(char));
+      }
+      text_t *line = malloc(col * sizeof(text_t));
+      memset(line, ' ', col);
+      memcpy(line, &lbuf[r * col], MIN(col, len - r * col) * sizeof(text_t));
+      out[nout] = line;
+      out_wrap[nout++] = r < nrows - 1;
+    }
+  }
+  free(lbuf);
+
+  // old rows are copied out; free them (spare history slots included)
+  for (int i = 0; i < HIST_SIZE; i++) {
+    free(hist[i]);
+    hist[i] = NULL;
+  }
+  for (int i = 0; i < screen.buf_rows; i++)
+    free(screen.buf_text[i]);
+
+  // screen shows the last rows, moved up if that would hide the cursor
+  int start = MAX(nout - row, 0);
+  if (cur_row < start)
+    start = cur_row;
+  // rows above the screen become history, oldest dropped past HIST_SIZE
+  int skip = MAX(start - HIST_SIZE, 0);
+  for (int i = 0; i < skip; i++)
+    free(out[i]);
+  hist_len = start - skip;
+  hist_head = hist_len % HIST_SIZE;
+  for (int i = 0; i < hist_len; i++) {
+    hist[i] = out[skip + i];
+    hist_wrap[i] = out_wrap[skip + i];
+  }
+  screen.buf_text = realloc(screen.buf_text, row * sizeof(text_t *));
+  screen.buf_wrap = realloc(screen.buf_wrap, row * sizeof(char));
+  for (int i = 0; i < row; i++) {
+    if (start + i < nout) {
+      screen.buf_text[i] = out[start + i];
+      screen.buf_wrap[i] = out_wrap[start + i];
+    } else {
+      screen.buf_text[i] = malloc(col * sizeof(text_t));
+      memset(screen.buf_text[i], ' ', col);
+      screen.buf_wrap[i] = 0;
+    }
+  }
+  // rows below the screen only exist when the cursor forced start up
+  for (int i = start + row; i < nout; i++)
+    free(out[i]);
+  free(out);
+  free(out_wrap);
+
+  screen.buf_rows = row;
+  screen.buf_cols = col;
   screen.view_rows = row;
   screen.view_cols = col;
   screen.scroll_top = 0;
   screen.scroll_bot = row - 1;
   screen.scroll_off = 0;
   wrap_next = 0;
-  TextCursor *cursor = &screen.cursor;
-  if (cursor != NULL) {
-    if (cursor->row > row - 1) {
-      cursor->row = row - 1;
-    }
-    if (cursor->col > col - 1) {
-      cursor->col = col - 1;
-    }
-  }
+  cursor->row = cur_row - start;
+  cursor->col = cur_col;
 }
 void cresize(int row, int col) {
   tresize(row, col);

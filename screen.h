@@ -36,6 +36,7 @@ typedef struct {
   int char_width;
   int char_height;
   text_t **buf_text;
+  char *buf_wrap; // buf_wrap[i]: row i was soft-wrapped onto row i + 1
   int buf_rows;
   int buf_cols;
   int view_rows;
