@@ -8,6 +8,7 @@
 #define SCREEN_HEIGHT 600
 #define BG_COLOR 0x001e1e1e
 #define FG_COLOR 0x00FFFFFF
+#define HIST_SIZE 10000 // scrollback lines kept
 #define MIN(a, b)   ((a) < (b) ? (a) : (b))
 #define MAX(a, b)   ((a) < (b) ? (b) : (a))
 
@@ -41,6 +42,7 @@ typedef struct {
   int view_cols;
   int scroll_top; // scroll region rows, 0-based inclusive (CSI r)
   int scroll_bot;
+  int scroll_off; // rows scrolled back into history, 0 = live screen
 } TermScreen;
 
 void update_screen_pty(int pty_fd);
@@ -60,5 +62,6 @@ int screen_app_cursor_keys();
 void screen_refresh();
 void print_screen_buf_text(int view);
 void screen_resize_handler(XEvent *);
+void screen_scroll(int n);
 
 #endif

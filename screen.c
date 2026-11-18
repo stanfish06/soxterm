@@ -17,6 +17,33 @@
 
 static TermScreen screen;
 
+// scrollback: ring of lines that scrolled off the top of the screen
+static text_t *hist[HIST_SIZE];
+static int hist_head = 0; // slot the next line goes into
+static int hist_len = 0;  // lines stored, at most HIST_SIZE
+
+// store line as the newest history entry; returns a spare line for reuse
+static text_t *hist_push(text_t *line) {
+  text_t *spare = hist[hist_head];
+  hist[hist_head] = line;
+  hist_head = (hist_head + 1) % HIST_SIZE;
+  if (hist_len < HIST_SIZE)
+    hist_len++;
+  return spare ? spare : malloc(screen.buf_cols * sizeof(text_t));
+}
+
+// line shown at view row; rows above the live screen come from history
+static text_t *view_line(int row) {
+  if (row < screen.scroll_off)
+    return hist[(hist_head - screen.scroll_off + row + HIST_SIZE) % HIST_SIZE];
+  return screen.buf_text[row - screen.scroll_off];
+}
+
+// scroll the view n rows back into history (negative goes forward)
+void screen_scroll(int n) {
+  screen.scroll_off = MIN(MAX(screen.scroll_off + n, 0), hist_len);
+}
+
 void update_screen_pty(int pty_fd) {
     if (pty_fd > 0)
         screen.pty_fd = pty_fd ;
@@ -141,7 +168,7 @@ void screen_draw_block_text(int row, int col, int nrows, int ncols) {
     for (int j = 0; j < ncols; ++j) {
       int _col = col + j;
       if (_row < screen.view_rows && _col < screen.view_cols) {
-        text[j] = screen.buf_text[_row][_col];
+        text[j] = view_line(_row)[_col];
       }
     }
     text[ncols] = '\0';
@@ -156,9 +183,10 @@ void screen_draw_all_text() {
 }
 
 // draw char from buffer; glyph only, the cell background is left as is
+// row is a buffer row, shifted down by scroll_off on the window
 void screen_draw_char(int row, int col, XftColor *color) {
   int x = col * screen.char_width;
-  int y = row * screen.char_height + screen.font->ascent;
+  int y = (row + screen.scroll_off) * screen.char_height + screen.font->ascent;
   XftDrawString8(screen.draw, color, screen.font, x, y,
                  screen_get_char(row, col), 1);
 }
@@ -192,8 +220,11 @@ void screen_greet() {
 void screen_draw_block_cursor() {
   int row = screen.cursor.row;
   int col = screen.cursor.col;
+  // hide the cursor once scrolling pushes it below the view
+  if (row + screen.scroll_off >= screen.view_rows)
+    return;
   int x = col * screen.char_width;
-  int y = row * screen.char_height;
+  int y = (row + screen.scroll_off) * screen.char_height;
   XSetForeground(screen.display, screen.gc, FG_COLOR);
   XFillRectangle(screen.display, screen.window, screen.gc, x, y,
                  screen.char_width, screen.char_height);
@@ -326,9 +357,13 @@ static void scroll_down(int top, int bot, int n) {
 
 // LF/IND: down one row, scrolling the region when on its bottom margin
 static void linefeed(TextCursor *cursor) {
-  if (cursor->row == screen.scroll_bot)
+  if (cursor->row == screen.scroll_bot) {
+    // the top line leaves the screen only when the region starts at row 0;
+    // keep it in history and rotate a spare line in to be blanked
+    if (screen.scroll_top == 0)
+      screen.buf_text[0] = hist_push(screen.buf_text[0]);
     scroll_up(screen.scroll_top, screen.scroll_bot, 1);
-  else
+  } else
     move_to(cursor, cursor->row + 1, cursor->col);
   wrap_next = 0;
 }
@@ -480,8 +515,11 @@ void handle_csi_escape(TextCursor *cursor) {
         erase_cells(r, 0, cols);
       erase_cells(row, 0, col + 1);
       break;
+    case 3: // 3 also clears scrollback
+      hist_len = 0;
+      screen.scroll_off = 0;
+      // fall through
     case 2:
-    case 3: // 3 also clears scrollback, which myTerm doesn't have
       for (int r = 0; r < rows; r++)
         erase_cells(r, 0, cols);
       break;
@@ -619,6 +657,8 @@ void screen_feed(const char *buf, int len) {
   if (cursor == NULL || buf == NULL || len <= 0) {
     return;
   }
+  // new output returns the view to the live screen
+  screen.scroll_off = 0;
   for (int i = 0; i < len; ++i) {
     unsigned char c = (unsigned char)buf[i];
     // OSC strings swallow everything up to BEL or ESC '\'
@@ -691,6 +731,13 @@ void tresize(int row, int col) {
       memset(&screen.buf_text[i][screen.buf_cols], ' ', 
           col - screen.buf_cols);
     }
+    // widen history lines too, they get reused as screen rows
+    for (int i = 0; i < HIST_SIZE; ++i) {
+      if (hist[i] == NULL)
+        continue;
+      hist[i] = realloc(hist[i], col * sizeof(text_t));
+      memset(&hist[i][screen.buf_cols], ' ', col - screen.buf_cols);
+    }
     screen.buf_cols = col;
   }
   if (row > screen.buf_rows) {
@@ -706,6 +753,7 @@ void tresize(int row, int col) {
   screen.view_cols = col;
   screen.scroll_top = 0;
   screen.scroll_bot = row - 1;
+  screen.scroll_off = 0;
   wrap_next = 0;
   TextCursor *cursor = &screen.cursor;
   if (cursor != NULL) {

@@ -15,6 +15,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define SCROLL_LINES 3 // rows per mouse wheel notch
+
 Display *main_display = NULL;
 Window main_window = 0;
 ScrollBar main_scrollbar;
@@ -128,7 +130,8 @@ static int encode_cursor_key(KeySym sym, unsigned int state, char *out,
 int main() {
   create_window();
   XSelectInput(main_display, main_window,
-               ExposureMask | KeyPressMask | StructureNotifyMask);
+               ExposureMask | KeyPressMask | ButtonPressMask |
+                   StructureNotifyMask);
 
   struct winsize ws;
   int vrows, vcols;
@@ -185,14 +188,35 @@ int main() {
         } else if (e.type == ConfigureNotify) {
           (handler[e.type])(&e);
           needs_redraw = 1;
+        } else if (e.type == ButtonPress) {
+          // wheel: button 4 scrolls back, button 5 forward
+          if (e.xbutton.button == Button4) {
+            screen_scroll(SCROLL_LINES);
+            needs_redraw = 1;
+          } else if (e.xbutton.button == Button5) {
+            screen_scroll(-SCROLL_LINES);
+            needs_redraw = 1;
+          }
         } else if (e.type == KeyPress) {
           char buf[32] = {0};
           KeySym keysym;
           int count = XLookupString(&e.xkey, buf, sizeof(buf), &keysym, NULL);
+          // Shift+PgUp/PgDn scroll history by a page, not sent to the pty
+          if ((e.xkey.state & ShiftMask) &&
+              (keysym == XK_Prior || keysym == XK_Next)) {
+            int rows, cols;
+            screen_view_size(&rows, &cols);
+            screen_scroll(keysym == XK_Prior ? rows : -rows);
+            needs_redraw = 1;
+            continue;
+          }
           char seq[16];
           int seq_len =
               encode_cursor_key(keysym, e.xkey.state, seq, sizeof(seq));
           if (seq_len > 0) {
+            // input to the pty returns the view to the live screen
+            screen_scroll(-HIST_SIZE);
+            needs_redraw = 1;
             write(pty_fd, seq, seq_len);
             continue;
           }
@@ -204,6 +228,8 @@ int main() {
             count = 1;
           }
           if (count > 0) {
+            screen_scroll(-HIST_SIZE);
+            needs_redraw = 1;
             if (e.xkey.state & Mod1Mask)
               write(pty_fd, "\033", 1);
             write(pty_fd, buf, count);
