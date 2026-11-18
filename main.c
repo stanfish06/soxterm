@@ -2,8 +2,10 @@
 #include "pty.h"
 #include "screen.h"
 #include "scrollbar.h"
+#include <X11/X.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <errno.h>
@@ -18,6 +20,10 @@ Window main_window = 0;
 ScrollBar main_scrollbar;
 GC main_gc = 0;
 XftFont *main_font = NULL;
+
+static void (*handler[LASTEvent]) (XEvent *) = {
+  [ConfigureNotify] = screen_resize_handler
+};
 
 void create_window() {
   main_display = XOpenDisplay(NULL);
@@ -34,6 +40,14 @@ void create_window() {
     main_window =
         XCreateSimpleWindow(main_display, root_window, 0, 0, SCREEN_WIDTH,
                             SCREEN_HEIGHT, 0, 0, BG_COLOR);
+    XSizeHints *hints = XAllocSizeHints();
+    hints->flags = PMinSize | PMaxSize;
+    hints->min_width = 400;
+    hints->min_height = 300;
+    hints->max_width = 1920;
+    hints->max_height = 1080;
+    XSetWMNormalHints(main_display, main_window, hints);
+    XFree(hints);
 
     /***************
      * make cursor
@@ -45,6 +59,10 @@ void create_window() {
     }
     // add cursor to window
     XDefineCursor(main_display, main_window, cursor);
+    TextCursor text_cursor;
+    text_cursor.row = 0;
+    text_cursor.col = 0;
+    text_cursor.visible = 1;
 
     /**************
      * scroll bar
@@ -74,7 +92,7 @@ void create_window() {
     // XMapWindow(main_display, main_scrollbar.win);
     // flush all data now. Generally not needed after having event loop
     XFlush(main_display);
-    screen_init(main_display, main_window, main_gc, main_font);
+    screen_init(main_display, main_window, text_cursor, main_gc, main_font);
   }
 }
 
@@ -111,10 +129,6 @@ int main() {
   create_window();
   XSelectInput(main_display, main_window,
                ExposureMask | KeyPressMask | StructureNotifyMask);
-  TextCursor cursor;
-  cursor.row = 0;
-  cursor.col = 0;
-  cursor.visible = 1;
 
   struct winsize ws;
   int vrows, vcols;
@@ -129,7 +143,7 @@ int main() {
     fprintf(stderr, "Error: failed to start PTY\n");
     return 1;
   }
-
+  update_screen_pty(pty_fd);
   int xfd = ConnectionNumber(main_display);
   for (;;) {
     fd_set rfds;
@@ -152,7 +166,7 @@ int main() {
       char buf[4096];
       int n = (int)read(pty_fd, buf, sizeof(buf));
       if (n > 0) {
-        screen_feed(&cursor, buf, n);
+        screen_feed(buf, n);
         needs_redraw = 1;
       } else if (n == 0) {
         break;
@@ -169,11 +183,8 @@ int main() {
         if (e.type == Expose) {
           needs_redraw = 1;
         } else if (e.type == ConfigureNotify) {
-          int vrows, vcols;
-          if (update_screen_size(&cursor, &vrows, &vcols)) {
-            pty_set_winsize(pty_fd, vrows, vcols);
-            needs_redraw = 1;
-          }
+          (handler[e.type])(&e);
+          needs_redraw = 1;
         } else if (e.type == KeyPress) {
           char buf[32] = {0};
           KeySym keysym;
@@ -205,7 +216,7 @@ int main() {
 
     if (needs_redraw) {
       screen_draw_all_text();
-      screen_draw_block_cursor(cursor.row, cursor.col);
+      screen_draw_block_cursor();
       XFlush(main_display);
     }
   }

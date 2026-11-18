@@ -1,5 +1,7 @@
 #include "screen.h"
+#include "pty.h"
 #include "string.h"
+#include <X11/X.h>
 #include <X11/Xlib.h>
 #include <X11/cursorfont.h>
 #include <limits.h>
@@ -15,6 +17,10 @@
 
 static TermScreen screen;
 
+void update_screen_pty(int pty_fd) {
+    if (pty_fd > 0)
+        screen.pty_fd = pty_fd ;
+}
 // allocate an XftColor from a 0x00RRGGBB value
 static void alloc_color(unsigned long rgb, XftColor *out) {
   int scr = DefaultScreen(screen.display);
@@ -32,7 +38,7 @@ static void alloc_color(unsigned long rgb, XftColor *out) {
   }
 }
 
-void screen_init(Display *display, Window window, GC gc, XftFont *font) {
+void screen_init(Display *display, Window window, TextCursor cursor, GC gc, XftFont *font) {
   screen.display = display;
   screen.window = window;
   screen.gc = gc;
@@ -51,10 +57,7 @@ void screen_init(Display *display, Window window, GC gc, XftFont *font) {
   screen.char_width = ext.xOff;
   screen.char_height = font->ascent + font->descent;
 
-  screen.cursor.row = 0;
-  screen.cursor.col = 0;
-  screen.cursor.visible = 1;
-
+  screen.cursor = cursor;
   screen.view_rows = SCREEN_HEIGHT / screen.char_height;
   screen.view_cols = SCREEN_WIDTH / screen.char_width;
   screen.buf_rows = screen.view_rows;
@@ -68,6 +71,7 @@ void screen_init(Display *display, Window window, GC gc, XftFont *font) {
     memset(screen.buf_text[i], ' ', screen.buf_cols);
   }
 }
+
 
 // for debug
 void print_screen_buf_text(int view) {
@@ -185,7 +189,9 @@ void screen_greet() {
 // is under the cursor and invert the color of those text so that it will be
 // visible. Once cursor leave the text, invert the text back try array of
 // strings to store lines
-void screen_draw_block_cursor(int row, int col) {
+void screen_draw_block_cursor() {
+  int row = screen.cursor.row;
+  int col = screen.cursor.col;
   int x = col * screen.char_width;
   int y = row * screen.char_height;
   XSetForeground(screen.display, screen.gc, FG_COLOR);
@@ -194,10 +200,11 @@ void screen_draw_block_cursor(int row, int col) {
   screen_draw_char(row, col, &screen.cursor_fg);
 }
 
-void move_cursor(TextCursor *cursor, int num_cols_shift, int num_rows_shift,
+void move_cursor(int num_cols_shift, int num_rows_shift,
                  int direction, int horizontal) {
+  TextCursor *cursor = &screen.cursor;
   // first remove previous cursor
-  remove_cursor(cursor);
+  remove_cursor();
   // immediately redraw previous char
   screen_draw_char(cursor->row, cursor->col, &screen.fg);
   if (horizontal == 1) {
@@ -213,10 +220,11 @@ void move_cursor(TextCursor *cursor, int num_cols_shift, int num_rows_shift,
       cursor->row = fmax(cursor->row - num_rows_shift, 0);
     }
   }
-  screen_draw_block_cursor(cursor->row, cursor->col);
+  screen_draw_block_cursor();
 }
 
-void remove_cursor(TextCursor *cursor) {
+void remove_cursor() {
+  TextCursor *cursor = &screen.cursor;
   int x = cursor->col * screen.char_width;
   int y = cursor->row * screen.char_height;
   XSetForeground(screen.display, screen.gc, BG_COLOR);
@@ -224,10 +232,11 @@ void remove_cursor(TextCursor *cursor) {
                  screen.char_width, screen.char_height);
 }
 
-void delete_at_cursor(TextCursor *cursor) {
-  remove_cursor(cursor);
+void delete_at_cursor() {
+  TextCursor *cursor = &screen.cursor;
+  remove_cursor();
   screen_put_char(' ', cursor->row, cursor->col);
-  screen_draw_block_cursor(cursor->row, cursor->col);
+  screen_draw_block_cursor();
 }
 
 typedef struct {
@@ -605,7 +614,8 @@ static void put_printable(TextCursor *cursor, text_t c) {
     wrap_next = 1;
 }
 
-void screen_feed(TextCursor *cursor, const char *buf, int len) {
+void screen_feed(const char *buf, int len) {
+  TextCursor *cursor = &screen.cursor;
   if (cursor == NULL || buf == NULL || len <= 0) {
     return;
   }
@@ -667,65 +677,56 @@ void screen_feed(TextCursor *cursor, const char *buf, int len) {
   }
 }
 
+// for screen resize
 void screen_view_size(int *rows, int *cols) {
   *rows = screen.view_rows;
   *cols = screen.view_cols;
 }
-
-int update_screen_size(TextCursor *cursor, int *out_rows, int *out_cols) {
-  XWindowAttributes attrs;
-  if (!XGetWindowAttributes(screen.display, screen.window, &attrs)) {
-    return 0;
-  }
-  int view_rows = attrs.height / screen.char_height;
-  int view_cols = attrs.width / screen.char_width;
-  if (view_rows < 1) {
-    view_rows = 1;
-  }
-  if (view_cols < 1) {
-    view_cols = 1;
-  }
-  if (view_rows == screen.view_rows && view_cols == screen.view_cols) {
-    return 0;
-  }
-
-  if (view_cols > screen.buf_cols) {
+void tresize(int row, int col) {
+  // add white spaces
+  if (col > screen.buf_cols) {
     for (int i = 0; i < screen.buf_rows; ++i) {
       screen.buf_text[i] =
-          realloc(screen.buf_text[i], view_cols * sizeof(text_t));
-      memset(&screen.buf_text[i][screen.buf_cols], ' ',
-             view_cols - screen.buf_cols);
+          realloc(screen.buf_text[i], col * sizeof(text_t));
+      memset(&screen.buf_text[i][screen.buf_cols], ' ', 
+          col - screen.buf_cols);
     }
-    screen.buf_cols = view_cols;
+    screen.buf_cols = col;
   }
-  if (view_rows > screen.buf_rows) {
-    screen.buf_text = realloc(screen.buf_text, view_rows * sizeof(text_t *));
-    for (int i = screen.buf_rows; i < view_rows; ++i) {
+  if (row > screen.buf_rows) {
+    screen.buf_text = realloc(screen.buf_text, row * sizeof(text_t *));
+    for (int i = screen.buf_rows; i < row; ++i) {
       screen.buf_text[i] = malloc(screen.buf_cols * sizeof(text_t));
       memset(screen.buf_text[i], ' ', screen.buf_cols);
     }
-    screen.buf_rows = view_rows;
+    screen.buf_rows = row;
   }
 
-  screen.view_rows = view_rows;
-  screen.view_cols = view_cols;
-  // reset the scroll region to the full screen, as xterm does on resize
+  screen.view_rows = row;
+  screen.view_cols = col;
   screen.scroll_top = 0;
-  screen.scroll_bot = view_rows - 1;
+  screen.scroll_bot = row - 1;
   wrap_next = 0;
+  TextCursor *cursor = &screen.cursor;
   if (cursor != NULL) {
-    if (cursor->row > view_rows - 1) {
-      cursor->row = view_rows - 1;
+    if (cursor->row > row - 1) {
+      cursor->row = row - 1;
     }
-    if (cursor->col > view_cols - 1) {
-      cursor->col = view_cols - 1;
+    if (cursor->col > col - 1) {
+      cursor->col = col - 1;
     }
   }
-  if (out_rows != NULL) {
-    *out_rows = view_rows;
-  }
-  if (out_cols != NULL) {
-    *out_cols = view_cols;
-  }
-  return 1;
+}
+void cresize(int row, int col) {
+  tresize(row, col);
+  pty_set_winsize(screen.pty_fd, screen.view_rows, screen.view_cols);
+}
+void screen_resize_handler(XEvent *e) {
+  int x_row = e->xconfigure.height / screen.char_height;
+  int x_col = e->xconfigure.width / screen.char_width;
+  x_row = MAX(x_row, 1);
+  x_col = MAX(x_col, 1);
+  if (x_col == screen.view_cols && x_row == screen.view_rows)
+    return;
+  cresize(x_row, x_col);
 }
