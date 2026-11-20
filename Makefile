@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -Wall -O2 $(shell pkg-config --cflags xft)
-LDLIBS = $(shell pkg-config --libs xft) -lX11 -lm
+CFLAGS = -Wall -O2 $(shell pkg-config --cflags xft fontconfig)
+LDLIBS = $(shell pkg-config --libs xft fontconfig) -lX11 -lm
 
 SRC = main.c screen.c pty.c
 OBJ = $(SRC:.c=.o)
@@ -14,8 +14,9 @@ $(TARGET): $(OBJ)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-main.o: config.h screen.h
-screen.o: screen.h
+main.o: screen.h pty.h
+screen.o: config.h screen.h pty.h
+pty.o: pty.h
 
 clean:
 	rm -f $(OBJ) $(TARGET)

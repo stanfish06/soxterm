@@ -10,7 +10,7 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define TERM_NAME "vt100"
+#define TERM_NAME "xterm-256color"
 
 /* termios.h
 struct winsize {

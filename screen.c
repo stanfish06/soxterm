@@ -1,44 +1,84 @@
+#define _XOPEN_SOURCE 600
+
 #include "screen.h"
+#include "config.h"
 #include "pty.h"
-#include "string.h"
-#include <X11/X.h>
-#include <X11/Xlib.h>
-#include <X11/cursorfont.h>
-#include <limits.h>
-#include <math.h>
+#include <fontconfig/fontconfig.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <wchar.h>
 
 #define UTF_SIZ 4
 #define ESC_BUF_SIZ (128 * UTF_SIZ)
 #define ESC_ARG_SIZ 16
 #define ESC_ARG_MAX 65535 // cap for a single CSI parameter
 #define TAB_WIDTH 8       // fixed tab stops every N columns
+#define FB_FONT_MAX 32    // cached fallback fonts
+#define MISS_CP_MAX 64    // codepoints known to have no font on the system
 
 static TermScreen screen;
 
 // scrollback: ring of lines that scrolled off the top of the screen
-static text_t *hist[HIST_SIZE];
+static Cell *hist[HIST_SIZE];
 static char hist_wrap[HIST_SIZE]; // soft-wrap flag per line, as buf_wrap
-static int hist_head = 0; // slot the next line goes into
-static int hist_len = 0;  // lines stored, at most HIST_SIZE
+static int hist_head = 0;         // slot the next line goes into
+static int hist_len = 0;          // lines stored, at most HIST_SIZE
+
+// fallback font cache for glyphs missing from screen.fonts[]
+static struct {
+  XftFont *font;
+  int style;
+} fb_fonts[FB_FONT_MAX];
+static int n_fb_fonts = 0;
+
+static uint32_t missing_cp[MISS_CP_MAX];
+static int missing_head = 0;
+
+static Cell default_cell(void) {
+  return (Cell){
+      .u = ' ',
+      .fg = COLOR_DEFAULT_FG,
+      .bg = COLOR_DEFAULT_BG,
+      .mode = 0,
+  };
+}
+
+// blank cell using the current SGR background (BCE)
+static Cell blank_cell(void) {
+  return (Cell){
+      .u = ' ',
+      .fg = screen.attr.fg,
+      .bg = screen.attr.bg,
+      .mode = 0,
+  };
+}
+
+static int is_default_blank(Cell g) {
+  return g.u == ' ' && g.bg == COLOR_DEFAULT_BG && g.mode == 0;
+}
+
+static void fill_cells(Cell *dst, int n, Cell g) {
+  for (int i = 0; i < n; i++)
+    dst[i] = g;
+}
 
 // store line as the newest history entry; returns a spare line for reuse
-static text_t *hist_push(text_t *line, char wrap) {
-  text_t *spare = hist[hist_head];
+static Cell *hist_push(Cell *line, char wrap) {
+  Cell *spare = hist[hist_head];
   hist[hist_head] = line;
   hist_wrap[hist_head] = wrap;
   hist_head = (hist_head + 1) % HIST_SIZE;
   if (hist_len < HIST_SIZE)
     hist_len++;
-  return spare ? spare : malloc(screen.buf_cols * sizeof(text_t));
+  return spare ? spare : malloc(screen.buf_cols * sizeof(Cell));
 }
 
 // line shown at view row; rows above the live screen come from history
-static text_t *view_line(int row) {
+static Cell *view_line(int row) {
   if (row < screen.scroll_off)
     return hist[(hist_head - screen.scroll_off + row + HIST_SIZE) % HIST_SIZE];
-  return screen.buf_text[row - screen.scroll_off];
+  return screen.buf[row - screen.scroll_off];
 }
 
 // scroll the view n rows back into history (negative goes forward)
@@ -46,12 +86,43 @@ void screen_scroll(int n) {
   screen.scroll_off = MIN(MAX(screen.scroll_off + n, 0), hist_len);
 }
 
+unsigned int screen_default_bg(void) { return defaultbg; }
+
 void update_screen_pty(int pty_fd) {
-    if (pty_fd > 0)
-        screen.pty_fd = pty_fd ;
+  if (pty_fd > 0)
+    screen.pty_fd = pty_fd;
 }
+
+// convert an indexed, default, or 24-bit color value to 0x00RRGGBB
+static uint32_t color_to_rgb(uint32_t c) {
+  if (c & COLOR_TRUE_BIT)
+    return c & 0xffffff;
+  if (c < 16)
+    return colorname[c];
+  if (c < 232) {
+    // 6x6x6 cube
+    static const uint8_t v[6] = {0, 95, 135, 175, 215, 255};
+    uint32_t idx = c - 16;
+    return ((uint32_t)v[idx / 36] << 16) | ((uint32_t)v[(idx / 6) % 6] << 8) |
+           v[idx % 6];
+  }
+  if (c < 256) {
+    // 24-step grayscale ramp
+    uint32_t g = 8 + (c - 232) * 10;
+    return (g << 16) | (g << 8) | g;
+  }
+  return (c == COLOR_DEFAULT_FG) ? defaultfg : defaultbg;
+}
+
+static uint32_t dim_rgb(uint32_t rgb) {
+  uint32_t r = ((rgb >> 16) & 0xff) * 2 / 3;
+  uint32_t g = ((rgb >> 8) & 0xff) * 2 / 3;
+  uint32_t b = (rgb & 0xff) * 2 / 3;
+  return (r << 16) | (g << 8) | b;
+}
+
 // allocate an XftColor from a 0x00RRGGBB value
-static void alloc_color(unsigned long rgb, XftColor *out) {
+static void alloc_color(uint32_t rgb, XftColor *out) {
   int scr = DefaultScreen(screen.display);
   // XRenderColor channels are 16-bit; 0xab -> 0xabab
   XRenderColor c = {
@@ -62,29 +133,140 @@ static void alloc_color(unsigned long rgb, XftColor *out) {
   };
   if (!XftColorAllocValue(screen.display, DefaultVisual(screen.display, scr),
                           DefaultColormap(screen.display, scr), &c, out)) {
-    fprintf(stderr, "Error: cannot allocate color 0x%06lx\n", rgb);
+    fprintf(stderr, "Error: cannot allocate color 0x%06x\n", rgb);
     exit(1);
   }
 }
 
-void screen_init(Display *display, Window window, TextCursor cursor, GC gc, XftFont *font) {
+static void free_color(XftColor *c) {
+  int scr = DefaultScreen(screen.display);
+  XftColorFree(screen.display, DefaultVisual(screen.display, scr),
+               DefaultColormap(screen.display, scr), c);
+}
+
+static int font_style(uint16_t mode) {
+  return ((mode & ATTR_BOLD) ? 1 : 0) | ((mode & ATTR_ITALIC) ? 2 : 0);
+}
+
+// open font with optional weight/slant overrides (-1 keeps pattern default)
+static XftFont *open_font_variant(Display *dpy, int scr, const char *name,
+                                  int weight, int slant) {
+  FcPattern *pat = FcNameParse((const FcChar8 *)name);
+  if (!pat)
+    return NULL;
+  if (weight >= 0) {
+    FcPatternDel(pat, FC_WEIGHT);
+    FcPatternAddInteger(pat, FC_WEIGHT, weight);
+  }
+  if (slant >= 0) {
+    FcPatternDel(pat, FC_SLANT);
+    FcPatternAddInteger(pat, FC_SLANT, slant);
+  }
+  FcResult res;
+  FcPattern *match = XftFontMatch(dpy, scr, pat, &res);
+  FcPatternDestroy(pat);
+  if (!match)
+    return NULL;
+  XftFont *f = XftFontOpenPattern(dpy, match);
+  if (!f)
+    FcPatternDestroy(match);
+  return f;
+}
+
+// return a font covering cp: primary -> cached fallback -> fontconfig match
+static XftFont *find_font(uint32_t cp, int style) {
+  Display *dpy = screen.display;
+  XftFont *primary = screen.fonts[style];
+  if (XftCharExists(dpy, primary, cp))
+    return primary;
+
+  for (int i = 0; i < n_fb_fonts; i++) {
+    if (fb_fonts[i].style == style && XftCharExists(dpy, fb_fonts[i].font, cp))
+      return fb_fonts[i].font;
+  }
+  for (int i = 0; i < MISS_CP_MAX; i++) {
+    if (missing_cp[i] == cp)
+      return primary;
+  }
+
+  // query fontconfig for a font at the same pixel size that has cp
+  int scr = DefaultScreen(dpy);
+  FcPattern *pat = FcPatternCreate();
+  FcCharSet *cs = FcCharSetCreate();
+  FcCharSetAddChar(cs, cp);
+  FcPatternAddCharSet(pat, FC_CHARSET, cs);
+  FcPatternAddDouble(pat, FC_PIXEL_SIZE, screen.font_px);
+  if (style & 1)
+    FcPatternAddInteger(pat, FC_WEIGHT, FC_WEIGHT_BOLD);
+  if (style & 2)
+    FcPatternAddInteger(pat, FC_SLANT, FC_SLANT_ITALIC);
+
+  FcResult res;
+  FcPattern *match = XftFontMatch(dpy, scr, pat, &res);
+  FcCharSetDestroy(cs);
+  FcPatternDestroy(pat);
+
+  XftFont *f = match ? XftFontOpenPattern(dpy, match) : NULL;
+  if (match && !f)
+    FcPatternDestroy(match);
+
+  if (f && XftCharExists(dpy, f, cp)) {
+    if (n_fb_fonts < FB_FONT_MAX) {
+      fb_fonts[n_fb_fonts].font = f;
+      fb_fonts[n_fb_fonts].style = style;
+      n_fb_fonts++;
+      return f;
+    }
+    XftFontClose(dpy, f);
+    return primary;
+  }
+  if (f)
+    XftFontClose(dpy, f);
+  // remember misses so repeated draws don't re-query fontconfig
+  missing_cp[missing_head] = cp;
+  missing_head = (missing_head + 1) % MISS_CP_MAX;
+  return primary;
+}
+
+void screen_init(Display *display, Window window, TextCursor cursor, GC gc) {
   screen.display = display;
   screen.window = window;
   screen.gc = gc;
-  screen.font = font;
 
   int scr = DefaultScreen(display);
   screen.draw = XftDrawCreate(display, window, DefaultVisual(display, scr),
                               DefaultColormap(display, scr));
-  alloc_color(FG_COLOR, &screen.fg);
-  alloc_color(0x000000, &screen.cursor_fg);
+
+  screen.fonts[0] = open_font_variant(display, scr, font, -1, -1);
+  if (!screen.fonts[0]) {
+    fprintf(stderr, "Error: cannot load font '%s'\n", font);
+    exit(1);
+  }
+  screen.fonts[1] = open_font_variant(display, scr, font, FC_WEIGHT_BOLD, -1);
+  screen.fonts[2] = open_font_variant(display, scr, font, -1, FC_SLANT_ITALIC);
+  screen.fonts[3] =
+      open_font_variant(display, scr, font, FC_WEIGHT_BOLD, FC_SLANT_ITALIC);
+  for (int i = 1; i < 4; i++) {
+    if (!screen.fonts[i])
+      screen.fonts[i] = screen.fonts[0];
+  }
+  if (FcPatternGetDouble(screen.fonts[0]->pattern, FC_PIXEL_SIZE, 0,
+                         &screen.font_px) != FcResultMatch)
+    screen.font_px = screen.fonts[0]->height;
+
+  // preallocate indexed + default colors so common draws do zero allocs
+  for (int i = 0; i < COLOR_COUNT; i++)
+    alloc_color(color_to_rgb(i), &screen.colors[i]);
+  alloc_color(defaultcs, &screen.cursor_bg);
+  alloc_color(defaultrcs, &screen.cursor_fg);
+  screen.attr = default_cell();
 
   // cell width from one glyph's advance; max_advance_width can be wider than
   // the real cell for fonts with a few oversized glyphs
   XGlyphInfo ext;
-  XftTextExtents8(display, font, (const FcChar8 *)"M", 1, &ext);
+  XftTextExtents8(display, screen.fonts[0], (const FcChar8 *)"M", 1, &ext);
   screen.char_width = ext.xOff;
-  screen.char_height = font->ascent + font->descent;
+  screen.char_height = screen.fonts[0]->ascent + screen.fonts[0]->descent;
 
   screen.cursor = cursor;
   screen.view_rows = SCREEN_HEIGHT / screen.char_height;
@@ -94,183 +276,146 @@ void screen_init(Display *display, Window window, TextCursor cursor, GC gc, XftF
   screen.scroll_top = 0;
   screen.scroll_bot = screen.view_rows - 1;
 
-  screen.buf_text = malloc(screen.buf_rows * sizeof(text_t *));
+  screen.buf = malloc(screen.buf_rows * sizeof(Cell *));
   for (int i = 0; i < screen.buf_rows; ++i) {
-    screen.buf_text[i] = malloc(screen.buf_cols * sizeof(text_t));
-    memset(screen.buf_text[i], ' ', screen.buf_cols);
+    screen.buf[i] = malloc(screen.buf_cols * sizeof(Cell));
+    fill_cells(screen.buf[i], screen.buf_cols, default_cell());
   }
   screen.buf_wrap = calloc(screen.buf_rows, sizeof(char));
 }
 
-
-// for debug
-void print_screen_buf_text(int view) {
-  int nrows = screen.buf_rows;
-  if (view) {
-    nrows = screen.view_rows;
+// draw a run of glyphs sharing attributes and font, covering ncells columns
+static void draw_run(int row, int col, int ncells, const FcChar32 *run,
+                     int run_len, XftFont *f, Cell g) {
+  uint32_t fg_id = g.fg;
+  uint32_t bg_id = g.bg;
+  // bold brightens standard ANSI colors 0-7
+  if ((g.mode & ATTR_BOLD) && fg_id < 8)
+    fg_id += 8;
+  if (g.mode & ATTR_REVERSE) {
+    uint32_t tmp = fg_id;
+    fg_id = bg_id;
+    bg_id = tmp;
   }
-  for (int i = 0; i < nrows; i++) {
-    printf("%s\n", screen.buf_text[i]);
-  }
-}
 
-void screen_put_char(text_t c, int row, int col) {
-  int _row = row;
-  int _col = col;
-  if (_row < 0) {
-    _row = 0;
-  } else if (_row > screen.view_rows - 1) {
-    _row = screen.view_rows - 1;
+  XftColor tmp_bg, tmp_fg;
+  int alloc_bg = 0, alloc_fg = 0;
+  unsigned long bg_pixel;
+  if (bg_id < COLOR_COUNT) {
+    bg_pixel = screen.colors[bg_id].pixel;
+  } else {
+    alloc_color(color_to_rgb(bg_id), &tmp_bg);
+    bg_pixel = tmp_bg.pixel;
+    alloc_bg = 1;
   }
-  if (_col < 0) {
-    _col = 0;
-  } else if (_col > screen.view_cols - 1) {
-    _col = screen.view_cols - 1;
+
+  XftColor *fg_col;
+  if (fg_id < COLOR_COUNT && !(g.mode & ATTR_FAINT)) {
+    fg_col = &screen.colors[fg_id];
+  } else {
+    uint32_t rgb = color_to_rgb(fg_id);
+    if (g.mode & ATTR_FAINT)
+      rgb = dim_rgb(rgb);
+    alloc_color(rgb, &tmp_fg);
+    fg_col = &tmp_fg;
+    alloc_fg = 1;
   }
-  screen.buf_text[_row][_col] = c;
-}
 
-text_t *screen_get_char(int row, int col) {
-  int _row = row;
-  int _col = col;
-  if (_row < 0) {
-    _row = 0;
-  } else if (_row > screen.view_rows - 1) {
-    _row = screen.view_rows - 1;
-  }
-  if (_col < 0) {
-    _col = 0;
-  } else if (_col > screen.view_cols - 1) {
-    _col = screen.view_cols - 1;
-  }
-  return &screen.buf_text[_row][_col];
-}
-
-void screen_clear() {
-  XSetForeground(screen.display, screen.gc, BG_COLOR);
-  XFillRectangle(screen.display, screen.window, screen.gc, 0, 0, SCREEN_WIDTH,
-                 SCREEN_HEIGHT);
-}
-
-void screen_put_text(const char *text, int row, int col) {
-  if (row < screen.view_rows) {
-    int text_len = strlen(text);
-    for (int i = 0; i < text_len; ++i) {
-      int _col = col + i;
-      if (_col < screen.view_cols) {
-        screen_put_char(text[i], row, _col);
-      }
-    }
-  }
-}
-
-void screen_draw_block_text(int row, int col, int nrows, int ncols) {
-  for (int i = 0; i < nrows; ++i) {
-    int _row = row + i;
-    text_t *text = calloc(ncols + 1, sizeof(text_t));
-    for (int j = 0; j < ncols; ++j) {
-      int _col = col + j;
-      if (_row < screen.view_rows && _col < screen.view_cols) {
-        text[j] = view_line(_row)[_col];
-      }
-    }
-    text[ncols] = '\0';
-    screen_draw_text(text, _row, col);
-    free(text);
-  }
-}
-
-// handy function to redraw full screen, for test only
-void screen_draw_all_text() {
-  screen_draw_block_text(0, 0, screen.view_rows, screen.view_cols);
-}
-
-// draw char from buffer; glyph only, the cell background is left as is
-// row is a buffer row, shifted down by scroll_off on the window
-void screen_draw_char(int row, int col, XftColor *color) {
   int x = col * screen.char_width;
-  int y = (row + screen.scroll_off) * screen.char_height + screen.font->ascent;
-  XftDrawString8(screen.draw, color, screen.font, x, y,
-                 screen_get_char(row, col), 1);
-}
+  int y_top = row * screen.char_height;
+  int w = ncells * screen.char_width;
+  int baseline = y_top + screen.fonts[0]->ascent;
 
-void screen_draw_text(const char *text, int row, int col) {
-  int x = col * screen.char_width;
-  // need to add extra ascent to get to the baseline position
-  int y = row * screen.char_height + screen.font->ascent;
-  int len = strlen(text);
-  // Xft draws glyphs only, so clear the cells first (XDrawImageString did both)
-  XSetForeground(screen.display, screen.gc, BG_COLOR);
-  XFillRectangle(screen.display, screen.window, screen.gc, x,
-                 row * screen.char_height, len * screen.char_width,
+  XSetForeground(screen.display, screen.gc, bg_pixel);
+  XFillRectangle(screen.display, screen.window, screen.gc, x, y_top, w,
                  screen.char_height);
-  // bytes map to Latin-1 glyphs, same as the core font path
-  XftDrawString8(screen.draw, &screen.fg, screen.font, x, y,
-                 (const FcChar8 *)text, len);
+
+  if (!(g.mode & ATTR_INVISIBLE)) {
+    XftDrawString32(screen.draw, fg_col, f, x, baseline, run, run_len);
+    if (g.mode & ATTR_UNDERLINE) {
+      int uy = MIN(baseline + 1, y_top + screen.char_height - 1);
+      XSetForeground(screen.display, screen.gc, fg_col->pixel);
+      XFillRectangle(screen.display, screen.window, screen.gc, x, uy, w, 1);
+    }
+    if (g.mode & ATTR_STRUCK) {
+      int sy = y_top + screen.char_height / 2;
+      XSetForeground(screen.display, screen.gc, fg_col->pixel);
+      XFillRectangle(screen.display, screen.window, screen.gc, x, sy, w, 1);
+    }
+  }
+
+  if (alloc_fg)
+    free_color(&tmp_fg);
+  if (alloc_bg)
+    free_color(&tmp_bg);
 }
 
-void screen_greet() {
-  screen_put_text("Hello world!", 0, 1);
-  screen_put_text("Hello world!", 20, 10);
+static void screen_draw_row(int row) {
+  Cell *line = view_line(row);
+  int cols = screen.view_cols;
+  FcChar32 run[cols];
+
+  for (int col = 0; col < cols;) {
+    Cell g = line[col];
+    if (g.mode & ATTR_WDUMMY) {
+      col++;
+      continue;
+    }
+    int style = font_style(g.mode);
+    XftFont *primary = screen.fonts[style];
+    XftFont *f = find_font(g.u, style);
+    int ncells = (g.mode & ATTR_WIDE) ? 2 : 1;
+    int run_len = 0;
+    run[run_len++] = g.u;
+
+    // batch adjacent single-cell primary-font glyphs with identical style
+    int next = col + ncells;
+    if (f == primary && ncells == 1) {
+      while (next < cols) {
+        Cell ng = line[next];
+        if (ng.fg != g.fg || ng.bg != g.bg || ng.mode != g.mode)
+          break;
+        if (!XftCharExists(screen.display, primary, ng.u))
+          break;
+        run[run_len++] = ng.u;
+        ncells++;
+        next++;
+      }
+    }
+    draw_run(row, col, ncells, run, run_len, f, g);
+    col = next;
+  }
 }
 
-// TODO you will need to swap fg bg color for the character covered by the
-// cursor cursor position needs to be pixel position curosr position has to be
-// stored to prevent cursor from blocking the text, you need to know what text
-// is under the cursor and invert the color of those text so that it will be
-// visible. Once cursor leave the text, invert the text back try array of
-// strings to store lines
-void screen_draw_block_cursor() {
+void screen_draw_all_text(void) {
+  for (int r = 0; r < screen.view_rows; r++)
+    screen_draw_row(r);
+}
+
+void screen_draw_block_cursor(void) {
   int row = screen.cursor.row;
   int col = screen.cursor.col;
   // hide the cursor once scrolling pushes it below the view
-  if (row + screen.scroll_off >= screen.view_rows)
+  if (!screen.cursor.visible || row + screen.scroll_off >= screen.view_rows)
     return;
-  int x = col * screen.char_width;
-  int y = (row + screen.scroll_off) * screen.char_height;
-  XSetForeground(screen.display, screen.gc, FG_COLOR);
-  XFillRectangle(screen.display, screen.window, screen.gc, x, y,
-                 screen.char_width, screen.char_height);
-  screen_draw_char(row, col, &screen.cursor_fg);
-}
-
-void move_cursor(int num_cols_shift, int num_rows_shift,
-                 int direction, int horizontal) {
-  TextCursor *cursor = &screen.cursor;
-  // first remove previous cursor
-  remove_cursor();
-  // immediately redraw previous char
-  screen_draw_char(cursor->row, cursor->col, &screen.fg);
-  if (horizontal == 1) {
-    if (direction == 1) {
-      cursor->col = fmin(cursor->col + num_cols_shift, screen.view_cols - 1);
-    } else if (direction == -1) {
-      cursor->col = fmax(cursor->col - num_cols_shift, 0);
-    }
-  } else {
-    if (direction == 1) {
-      cursor->row = fmin(cursor->row + num_rows_shift, screen.view_rows - 1);
-    } else if (direction == -1) {
-      cursor->row = fmax(cursor->row - num_rows_shift, 0);
-    }
+  Cell g = screen.buf[row][col];
+  if ((g.mode & ATTR_WDUMMY) && col > 0) {
+    col--;
+    g = screen.buf[row][col];
   }
-  screen_draw_block_cursor();
-}
+  int ncells = (g.mode & ATTR_WIDE) ? 2 : 1;
+  int x = col * screen.char_width;
+  int y_top = (row + screen.scroll_off) * screen.char_height;
+  int baseline = y_top + screen.fonts[0]->ascent;
 
-void remove_cursor() {
-  TextCursor *cursor = &screen.cursor;
-  int x = cursor->col * screen.char_width;
-  int y = cursor->row * screen.char_height;
-  XSetForeground(screen.display, screen.gc, BG_COLOR);
-  XFillRectangle(screen.display, screen.window, screen.gc, x, y,
-                 screen.char_width, screen.char_height);
-}
-
-void delete_at_cursor() {
-  TextCursor *cursor = &screen.cursor;
-  remove_cursor();
-  screen_put_char(' ', cursor->row, cursor->col);
-  screen_draw_block_cursor();
+  XSetForeground(screen.display, screen.gc, screen.cursor_bg.pixel);
+  XFillRectangle(screen.display, screen.window, screen.gc, x, y_top,
+                 ncells * screen.char_width, screen.char_height);
+  if (g.u && !(g.mode & ATTR_INVISIBLE)) {
+    FcChar32 cp = g.u;
+    XftFont *f = find_font(g.u, font_style(g.mode));
+    XftDrawString32(screen.draw, &screen.cursor_fg, f, x, baseline, &cp, 1);
+  }
 }
 
 typedef struct {
@@ -278,15 +423,11 @@ typedef struct {
   size_t len;
   char priv; // private marker ('?', '>', '<', '=') or 0
   int arg[ESC_ARG_SIZ];
+  char sep[ESC_ARG_SIZ]; // separator after arg[i]: ';', ':', or 0
   int narg;
   char mode[2];
 } CSIEscape;
 static CSIEscape csiescape;
-
-typedef struct {
-  char *buf;
-  size_t len;
-} STREscape;
 
 typedef enum {
   ESC_NONE,
@@ -298,14 +439,29 @@ typedef enum {
 } EscState;
 static EscState esc_state = ESC_NONE;
 
+// incremental UTF-8 decoder state across pty reads
+static uint32_t utf8_cp = 0;
+static int utf8_rem = 0;
+static uint32_t utf8_min = 0;
+
 // set after printing in the last column; the next printable char wraps first
 static int wrap_next = 0;
-// cursor saved by ESC 7, restored by ESC 8
+// cursor and pen saved by ESC 7, restored by ESC 8
 static TextCursor saved_cursor = {0, 0, 1};
+static Cell saved_attr = {' ', COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0};
 // DECCKM (CSI ?1h/l): cursor keys send SS3 (ESC O x) instead of CSI (ESC [ x)
 static int app_cursor_keys = 0;
 
-int screen_app_cursor_keys() { return app_cursor_keys; }
+int screen_app_cursor_keys(void) { return app_cursor_keys; }
+
+// if (row, col) is half of a wide glyph, blank its other half too
+static void clear_wide_cell(int row, int col) {
+  Cell *line = screen.buf[row];
+  if ((line[col].mode & ATTR_WDUMMY) && col > 0)
+    line[col - 1] = blank_cell();
+  else if ((line[col].mode & ATTR_WIDE) && col + 1 < screen.view_cols)
+    line[col + 1] = blank_cell();
+}
 
 // blank columns [from, to) on a row
 static void erase_cells(int row, int from, int to) {
@@ -313,8 +469,11 @@ static void erase_cells(int row, int from, int to) {
     from = 0;
   if (to > screen.view_cols)
     to = screen.view_cols;
-  for (int i = from; i < to; i++)
-    screen.buf_text[row][i] = ' ';
+  if (from < to) {
+    clear_wide_cell(row, from);
+    clear_wide_cell(row, to - 1);
+    fill_cells(&screen.buf[row][from], to - from, blank_cell());
+  }
   // erasing to the end of the row ends the line there
   if (to == screen.view_cols)
     screen.buf_wrap[row] = 0;
@@ -340,13 +499,13 @@ static void scroll_up(int top, int bot, int n) {
   if (n > bot - top + 1)
     n = bot - top + 1;
   for (int k = 0; k < n; k++) {
-    text_t *line = screen.buf_text[top];
-    memmove(&screen.buf_text[top], &screen.buf_text[top + 1],
-            (bot - top) * sizeof(text_t *));
+    Cell *line = screen.buf[top];
+    memmove(&screen.buf[top], &screen.buf[top + 1],
+            (bot - top) * sizeof(Cell *));
     memmove(&screen.buf_wrap[top], &screen.buf_wrap[top + 1], bot - top);
-    screen.buf_text[bot] = line;
+    screen.buf[bot] = line;
     screen.buf_wrap[bot] = 0;
-    memset(line, ' ', screen.buf_cols);
+    fill_cells(line, screen.buf_cols, blank_cell());
   }
 }
 
@@ -355,13 +514,13 @@ static void scroll_down(int top, int bot, int n) {
   if (n > bot - top + 1)
     n = bot - top + 1;
   for (int k = 0; k < n; k++) {
-    text_t *line = screen.buf_text[bot];
-    memmove(&screen.buf_text[top + 1], &screen.buf_text[top],
-            (bot - top) * sizeof(text_t *));
+    Cell *line = screen.buf[bot];
+    memmove(&screen.buf[top + 1], &screen.buf[top],
+            (bot - top) * sizeof(Cell *));
     memmove(&screen.buf_wrap[top + 1], &screen.buf_wrap[top], bot - top);
-    screen.buf_text[top] = line;
+    screen.buf[top] = line;
     screen.buf_wrap[top] = 0;
-    memset(line, ' ', screen.buf_cols);
+    fill_cells(line, screen.buf_cols, blank_cell());
   }
 }
 
@@ -371,7 +530,7 @@ static void linefeed(TextCursor *cursor) {
     // the top line leaves the screen only when the region starts at row 0;
     // keep it in history and rotate a spare line in to be blanked
     if (screen.scroll_top == 0)
-      screen.buf_text[0] = hist_push(screen.buf_text[0], screen.buf_wrap[0]);
+      screen.buf[0] = hist_push(screen.buf[0], screen.buf_wrap[0]);
     scroll_up(screen.scroll_top, screen.scroll_bot, 1);
   } else
     move_to(cursor, cursor->row + 1, cursor->col);
@@ -390,13 +549,16 @@ static void reverse_index(TextCursor *cursor) {
 // ICH: shift the rest of the line right by n and blank the gap
 static void insert_char_at_cursor(TextCursor *cursor, int n) {
   int cols = screen.view_cols;
-  // clamp so dst never passes the end of the line
   if (n > cols - cursor->col)
     n = cols - cursor->col;
   int src = cursor->col;
   int dst = src + n;
-  text_t *line = screen.buf_text[cursor->row];
-  memmove(&line[dst], &line[src], (cols - dst) * sizeof(*line));
+  clear_wide_cell(cursor->row, src);
+  Cell *line = screen.buf[cursor->row];
+  memmove(&line[dst], &line[src], (cols - dst) * sizeof(Cell));
+  // a wide glyph pushed past the right edge loses its trailing cell
+  if (line[cols - 1].mode & ATTR_WIDE)
+    line[cols - 1] = blank_cell();
   erase_cells(cursor->row, src, dst);
 }
 
@@ -407,15 +569,17 @@ static void delete_char_at_cursor(TextCursor *cursor, int n) {
     n = cols - cursor->col;
   int dst = cursor->col;
   int src = dst + n;
-  text_t *line = screen.buf_text[cursor->row];
-  memmove(&line[dst], &line[src], (cols - src) * sizeof(*line));
+  clear_wide_cell(cursor->row, dst);
+  if (src > 0)
+    clear_wide_cell(cursor->row, src - 1);
+  Cell *line = screen.buf[cursor->row];
+  memmove(&line[dst], &line[src], (cols - src) * sizeof(Cell));
   erase_cells(cursor->row, cols - n, cols);
 }
 
-void parse_csi_escape() {
+static void parse_csi_escape(void) {
   char *p = csiescape.buf, *np;
   long int v;
-  int sep = ';';
   csiescape.narg = 0;
   // 0x3c-0x3f as the first byte marks a private sequence
   if (*p >= '<' && *p <= '?') {
@@ -431,19 +595,121 @@ void parse_csi_escape() {
     // clamp so handlers can add args to row/col without overflow
     if (v < 0 || v > ESC_ARG_MAX)
       v = ESC_ARG_MAX;
-    csiescape.arg[csiescape.narg++] = v;
+    csiescape.arg[csiescape.narg] = v;
     p = np;
-    if (sep == ';' && *p == ':')
-      sep = ':';
-    if (*p != sep || csiescape.narg == ESC_ARG_SIZ)
+    if ((*p != ';' && *p != ':') || csiescape.narg == ESC_ARG_SIZ - 1) {
+      csiescape.sep[csiescape.narg++] = '\0';
       break;
-    p++;
+    }
+    csiescape.sep[csiescape.narg++] = *p++;
   }
   csiescape.mode[0] = *p++;
   csiescape.mode[1] = (p < csiescape.buf + csiescape.len) ? *p : '\0';
 }
 
-void handle_csi_escape(TextCursor *cursor) {
+// parse extended color after 38/48: 5;n (256-color) or 2;r;g;b / 2::r:g:b (RGB)
+// returns the extra args consumed, or 0 on invalid sequence
+static int parse_ext_color(const int *arg, const char *sep, int narg, int i,
+                           uint32_t *out) {
+  if (i + 1 >= narg)
+    return 0;
+  int kind = arg[i + 1];
+  if (kind == 5 && i + 2 < narg) {
+    *out = MIN(arg[i + 2], 255);
+    return 2;
+  }
+  if (kind == 2) {
+    // ISO 8613-6 colon form may include an extra colorspace arg: 38:2::r:g:b
+    int off = (sep[i] == ':' && i + 5 < narg && sep[i + 4] == ':') ? 3 : 2;
+    if (i + off + 2 < narg) {
+      int r = MIN(arg[i + off], 255);
+      int g = MIN(arg[i + off + 1], 255);
+      int b = MIN(arg[i + off + 2], 255);
+      *out = COLOR_TRUE(r, g, b);
+      return off + 2;
+    }
+  }
+  return 0;
+}
+
+// SGR (CSI ... m): update screen.attr
+static void handle_sgr(const int *arg, const char *sep, int narg) {
+  if (narg == 0) {
+    screen.attr = default_cell();
+    return;
+  }
+  for (int i = 0; i < narg; i++) {
+    int a = arg[i];
+    switch (a) {
+    case 0:
+      screen.attr = default_cell();
+      break;
+    case 1:
+      screen.attr.mode |= ATTR_BOLD;
+      break;
+    case 2:
+      screen.attr.mode |= ATTR_FAINT;
+      break;
+    case 3:
+      screen.attr.mode |= ATTR_ITALIC;
+      break;
+    case 4:
+      screen.attr.mode |= ATTR_UNDERLINE;
+      break;
+    case 7:
+      screen.attr.mode |= ATTR_REVERSE;
+      break;
+    case 8:
+      screen.attr.mode |= ATTR_INVISIBLE;
+      break;
+    case 9:
+      screen.attr.mode |= ATTR_STRUCK;
+      break;
+    case 22:
+      screen.attr.mode &= ~(ATTR_BOLD | ATTR_FAINT);
+      break;
+    case 23:
+      screen.attr.mode &= ~ATTR_ITALIC;
+      break;
+    case 24:
+      screen.attr.mode &= ~ATTR_UNDERLINE;
+      break;
+    case 27:
+      screen.attr.mode &= ~ATTR_REVERSE;
+      break;
+    case 28:
+      screen.attr.mode &= ~ATTR_INVISIBLE;
+      break;
+    case 29:
+      screen.attr.mode &= ~ATTR_STRUCK;
+      break;
+    case 38:
+      i += parse_ext_color(arg, sep, narg, i, &screen.attr.fg);
+      break;
+    case 39:
+      screen.attr.fg = COLOR_DEFAULT_FG;
+      break;
+    case 48:
+      i += parse_ext_color(arg, sep, narg, i, &screen.attr.bg);
+      break;
+    case 49:
+      screen.attr.bg = COLOR_DEFAULT_BG;
+      break;
+    default:
+      if (a >= 30 && a <= 37)
+        screen.attr.fg = a - 30;
+      else if (a >= 40 && a <= 47)
+        screen.attr.bg = a - 40;
+      else if (a >= 90 && a <= 97)
+        screen.attr.fg = a - 90 + 8;
+      else if (a >= 100 && a <= 107)
+        screen.attr.bg = a - 100 + 8;
+      break;
+    }
+  }
+}
+
+static void handle_csi_escape(TextCursor *cursor) {
   int *arg = csiescape.arg;
   int rows = screen.view_rows;
   int cols = screen.view_cols;
@@ -578,6 +844,9 @@ void handle_csi_escape(TextCursor *cursor) {
     DEFAULT(arg[0], 1);
     scroll_down(screen.scroll_top, screen.scroll_bot, arg[0]);
     break;
+  case 'm': // SGR: colors and text attributes
+    handle_sgr(arg, csiescape.sep, csiescape.narg);
+    break;
   case 'r': { // DECSTBM: scroll region top;bottom, then home the cursor
     DEFAULT(arg[0], 1);
     DEFAULT(arg[1], rows);
@@ -591,7 +860,7 @@ void handle_csi_escape(TextCursor *cursor) {
     }
     break;
   }
-  default: // SGR (m) and the rest: ignored until cells carry attributes
+  default:
     break;
   }
 }
@@ -609,11 +878,13 @@ static void handle_esc(TextCursor *cursor, unsigned char c) {
   case 'M': // RI: reverse line feed
     reverse_index(cursor);
     break;
-  case '7': // DECSC: save cursor
+  case '7': // DECSC: save cursor and pen
     saved_cursor = *cursor;
+    saved_attr = screen.attr;
     break;
-  case '8': // DECRC: restore cursor
+  case '8': // DECRC: restore cursor and pen
     move_to(cursor, saved_cursor.row, saved_cursor.col);
+    screen.attr = saved_attr;
     break;
   default: // ESC =, ESC >, ... ignored
     break;
@@ -622,6 +893,7 @@ static void handle_esc(TextCursor *cursor, unsigned char c) {
 
 // C0 controls; these run immediately, even inside an escape sequence
 static void handle_control(TextCursor *cursor, unsigned char c) {
+  utf8_rem = 0;
   switch (c) {
   case 0x1b: // ESC (re)starts a sequence, dropping any partial one
     esc_state = ESC_START;
@@ -649,26 +921,91 @@ static void handle_control(TextCursor *cursor, unsigned char c) {
   }
 }
 
-// write a char at the cursor, wrapping first if the last write hit the edge
-static void put_printable(TextCursor *cursor, text_t c) {
-  if (wrap_next) {
-    // mark the row as continued so resize can join it back
+// write a Unicode codepoint at the cursor, handling wrapping and 2-cell glyphs
+static void put_codepoint(TextCursor *cursor, uint32_t cp) {
+  int w = wcwidth((wchar_t)cp);
+  if (w <= 0)
+    return;
+  if (w == 2 && screen.view_cols < 2)
+    w = 1;
+
+  // wrap when previous write hit the edge or a wide char doesn't fit at end
+  if (wrap_next || (w == 2 && cursor->col == screen.view_cols - 1)) {
+    if (!wrap_next && w == 2)
+      erase_cells(cursor->row, cursor->col, cursor->col + 1);
     screen.buf_wrap[cursor->row] = 1;
     move_to(cursor, cursor->row, 0);
     linefeed(cursor);
   }
-  screen_put_char(c, cursor->row, cursor->col);
-  if (cursor->col < screen.view_cols - 1)
-    cursor->col += 1;
-  else
+
+  int row = cursor->row;
+  int col = cursor->col;
+  clear_wide_cell(row, col);
+  Cell g = screen.attr;
+  g.u = cp;
+  if (w == 2) {
+    clear_wide_cell(row, col + 1);
+    g.mode |= ATTR_WIDE;
+    screen.buf[row][col] = g;
+    screen.buf[row][col + 1] = (Cell){
+        .u = 0,
+        .fg = g.fg,
+        .bg = g.bg,
+        .mode = ATTR_WDUMMY,
+    };
+  } else {
+    screen.buf[row][col] = g;
+  }
+
+  if (col + w < screen.view_cols)
+    cursor->col = col + w;
+  else {
+    cursor->col = screen.view_cols - 1;
     wrap_next = 1;
+  }
+}
+
+// feed one non-control byte into the UTF-8 decoder and emit complete codepoints
+static void feed_utf8_byte(TextCursor *cursor, unsigned char c) {
+  if (utf8_rem > 0) {
+    if ((c & 0xc0) == 0x80) {
+      utf8_cp = (utf8_cp << 6) | (c & 0x3f);
+      if (--utf8_rem == 0) {
+        if (utf8_cp < utf8_min || utf8_cp > 0x10ffff ||
+            (utf8_cp >= 0xd800 && utf8_cp <= 0xdfff))
+          utf8_cp = 0xfffd;
+        put_codepoint(cursor, utf8_cp);
+      }
+      return;
+    }
+    // interrupted multi-byte sequence: emit U+FFFD and re-handle c below
+    utf8_rem = 0;
+    put_codepoint(cursor, 0xfffd);
+  }
+
+  if (c < 0x80) {
+    put_codepoint(cursor, c);
+  } else if ((c & 0xe0) == 0xc0) {
+    utf8_cp = c & 0x1f;
+    utf8_rem = 1;
+    utf8_min = 0x80;
+  } else if ((c & 0xf0) == 0xe0) {
+    utf8_cp = c & 0x0f;
+    utf8_rem = 2;
+    utf8_min = 0x800;
+  } else if ((c & 0xf8) == 0xf0) {
+    utf8_cp = c & 0x07;
+    utf8_rem = 3;
+    utf8_min = 0x10000;
+  } else {
+    put_codepoint(cursor, 0xfffd);
+  }
 }
 
 void screen_feed(const char *buf, int len) {
   TextCursor *cursor = &screen.cursor;
-  if (cursor == NULL || buf == NULL || len <= 0) {
+  if (cursor == NULL || buf == NULL || len <= 0)
     return;
-  }
   // new output returns the view to the live screen
   screen.scroll_off = 0;
   for (int i = 0; i < len; ++i) {
@@ -707,9 +1044,8 @@ void screen_feed(const char *buf, int len) {
       break;
     case ESC_INTER:
       // final byte ends it; charset selection (ESC ( B) etc. is ignored
-      if (c >= 0x30 && c <= 0x7e) {
+      if (c >= 0x30 && c <= 0x7e)
         esc_state = ESC_NONE;
-      }
       break;
     case ESC_CSI:
       // accumulate params; keep one byte for the '\0' parse_csi_escape adds
@@ -723,42 +1059,48 @@ void screen_feed(const char *buf, int len) {
       }
       break;
     default:
-      put_printable(cursor, c);
+      feed_utf8_byte(cursor, c);
       break;
     }
   }
 }
 
-// for screen resize
 void screen_view_size(int *rows, int *cols) {
   *rows = screen.view_rows;
   *cols = screen.view_cols;
 }
+
 // row i of history followed by the screen, oldest first
-static text_t *src_row(int i, char *wrap) {
+static Cell *src_row(int i, char *wrap) {
   if (i < hist_len) {
     int k = (hist_head - hist_len + i + HIST_SIZE) % HIST_SIZE;
     *wrap = hist_wrap[k];
     return hist[k];
   }
   *wrap = screen.buf_wrap[i - hist_len];
-  return screen.buf_text[i - hist_len];
+  return screen.buf[i - hist_len];
 }
 
-// screen row holds only blanks and doesn't continue on the next row
+// screen row holds only default blanks and doesn't continue on the next row
 static int row_blank(int r) {
   if (screen.buf_wrap[r])
     return 0;
   for (int i = 0; i < screen.view_cols; i++)
-    if (screen.buf_text[r][i] != ' ')
+    if (!is_default_blank(screen.buf[r][i]))
       return 0;
   return 1;
+}
+
+static Cell *alloc_blank_row(int cols) {
+  Cell *line = malloc(cols * sizeof(Cell));
+  fill_cells(line, cols, default_cell());
+  return line;
 }
 
 // reflow: join soft-wrapped rows of history + screen into logical lines and
 // cut them again at the new width; the cursor stays on the same char, rows
 // above the new screen go to history
-void tresize(int row, int col) {
+static void tresize(int row, int col) {
   TextCursor *cursor = &screen.cursor;
   int old_cols = screen.view_cols;
   // skip blank rows below the cursor so shrinking doesn't push them to history
@@ -768,50 +1110,89 @@ void tresize(int row, int col) {
   int nsrc = hist_len + last + 1;
   int cur_src = hist_len + cursor->row;
 
-  text_t **out = NULL; // rewrapped rows, oldest first
+  Cell **out = NULL; // rewrapped rows, oldest first
   char *out_wrap = NULL;
   int nout = 0, cap = 0;
-  text_t *lbuf = NULL; // one logical line
+  Cell *lbuf = NULL; // one logical line (without ATTR_WDUMMY placeholders)
   int lcap = 0;
   int cur_row = 0, cur_col = 0;
+
   for (int i = 0; i < nsrc;) {
-    // gather rows until one that isn't soft-wrapped
     int len = 0, cur_off = -1;
     char wrap;
     do {
-      text_t *src = src_row(i, &wrap);
+      Cell *src = src_row(i, &wrap);
       if (len + old_cols > lcap) {
         lcap = (len + old_cols) * 2;
-        lbuf = realloc(lbuf, lcap * sizeof(text_t));
+        lbuf = realloc(lbuf, lcap * sizeof(Cell));
       }
-      memcpy(&lbuf[len], src, old_cols * sizeof(text_t));
-      if (i == cur_src)
-        cur_off = len + cursor->col;
-      len += old_cols;
+      // skip padding cell left at the edge when a wide char wrapped early
+      char next_wrap;
+      int end = old_cols;
+      if (wrap && i + 1 < nsrc &&
+          (src_row(i + 1, &next_wrap)[0].mode & ATTR_WIDE) &&
+          is_default_blank(src[old_cols - 1]) &&
+          !(i == cur_src && cursor->col == old_cols - 1))
+        end--;
+      for (int j = 0; j < end; j++) {
+        if (i == cur_src && j == cursor->col)
+          cur_off = (src[j].mode & ATTR_WDUMMY) ? MAX(len - 1, 0) : len;
+        if (src[j].mode & ATTR_WDUMMY)
+          continue;
+        lbuf[len++] = src[j];
+      }
       i++;
     } while (wrap && i < nsrc);
-    // trailing blanks don't need rows, but the cursor's cell does
-    while (len > 0 && lbuf[len - 1] == ' ')
+
+    // drop trailing blanks, but keep up to the cursor's cell
+    while (len > 0 && len - 1 > cur_off && is_default_blank(lbuf[len - 1]))
       len--;
-    if (cur_off >= len)
-      len = cur_off + 1;
-    if (cur_off >= 0) {
-      cur_row = nout + cur_off / col;
-      cur_col = cur_off % col;
+
+    // emit at least one row for this logical line, never splitting wide glyphs
+    if (nout == cap) {
+      cap = cap ? cap * 2 : 64;
+      out = realloc(out, cap * sizeof(Cell *));
+      out_wrap = realloc(out_wrap, cap * sizeof(char));
     }
-    // cut into rows of the new width; an empty line still takes one row
-    int nrows = len > 0 ? (len + col - 1) / col : 1;
-    for (int r = 0; r < nrows; r++) {
-      if (nout == cap) {
-        cap = cap ? cap * 2 : 64;
-        out = realloc(out, cap * sizeof(text_t *));
-        out_wrap = realloc(out_wrap, cap * sizeof(char));
+    out[nout] = alloc_blank_row(col);
+    out_wrap[nout++] = 0;
+    if (len == 0 && cur_off == 0) {
+      cur_row = nout - 1;
+      cur_col = 0;
+    }
+    int c = 0;
+    for (int p = 0; p < len; p++) {
+      Cell g = lbuf[p];
+      int w = (g.mode & ATTR_WIDE) ? 2 : 1;
+      if (w == 2 && col < 2) {
+        g.mode &= ~ATTR_WIDE;
+        w = 1;
       }
-      text_t *line = malloc(col * sizeof(text_t));
-      memset(line, ' ', col);
-      memcpy(line, &lbuf[r * col], MIN(col, len - r * col) * sizeof(text_t));
-      out[nout] = line;
-      out_wrap[nout++] = r < nrows - 1;
+      if (c + w > col) {
+        out_wrap[nout - 1] = 1;
+        if (nout == cap) {
+          cap *= 2;
+          out = realloc(out, cap * sizeof(Cell *));
+          out_wrap = realloc(out_wrap, cap * sizeof(char));
+        }
+        out[nout] = alloc_blank_row(col);
+        out_wrap[nout++] = 0;
+        c = 0;
+      }
+      if (p == cur_off) {
+        cur_row = nout - 1;
+        cur_col = c;
+      }
+      out[nout - 1][c] = g;
+      if (w == 2) {
+        out[nout - 1][c + 1] = (Cell){
+            .u = 0,
+            .fg = g.fg,
+            .bg = g.bg,
+            .mode = ATTR_WDUMMY,
+        };
+      }
+      c += w;
     }
   }
   free(lbuf);
@@ -822,7 +1203,7 @@ void tresize(int row, int col) {
     hist[i] = NULL;
   }
   for (int i = 0; i < screen.buf_rows; i++)
-    free(screen.buf_text[i]);
+    free(screen.buf[i]);
 
   // screen shows the last rows, moved up if that would hide the cursor
   int start = MAX(nout - row, 0);
@@ -838,15 +1219,14 @@ void tresize(int row, int col) {
     hist[i] = out[skip + i];
     hist_wrap[i] = out_wrap[skip + i];
   }
-  screen.buf_text = realloc(screen.buf_text, row * sizeof(text_t *));
+  screen.buf = realloc(screen.buf, row * sizeof(Cell *));
   screen.buf_wrap = realloc(screen.buf_wrap, row * sizeof(char));
   for (int i = 0; i < row; i++) {
     if (start + i < nout) {
-      screen.buf_text[i] = out[start + i];
+      screen.buf[i] = out[start + i];
       screen.buf_wrap[i] = out_wrap[start + i];
     } else {
-      screen.buf_text[i] = malloc(col * sizeof(text_t));
-      memset(screen.buf_text[i], ' ', col);
+      screen.buf[i] = alloc_blank_row(col);
       screen.buf_wrap[i] = 0;
     }
   }
@@ -867,10 +1247,12 @@ void tresize(int row, int col) {
   cursor->row = cur_row - start;
   cursor->col = cur_col;
 }
-void cresize(int row, int col) {
+
+static void cresize(int row, int col) {
   tresize(row, col);
   pty_set_winsize(screen.pty_fd, screen.view_rows, screen.view_cols);
 }
+
 void screen_resize_handler(XEvent *e) {
   int x_row = e->xconfigure.height / screen.char_height;
   int x_col = e->xconfigure.width / screen.char_width;

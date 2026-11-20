@@ -1,14 +1,13 @@
-#include "config.h"
 #include "pty.h"
 #include "screen.h"
 #include "scrollbar.h"
 #include <X11/X.h>
-#include <X11/Xft/Xft.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
 #include <errno.h>
+#include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/select.h>
@@ -21,7 +20,6 @@ Display *main_display = NULL;
 Window main_window = 0;
 ScrollBar main_scrollbar;
 GC main_gc = 0;
-XftFont *main_font = NULL;
 
 // shared with the event handlers, which only get the XEvent
 static int pty_fd = -1;
@@ -33,11 +31,11 @@ static void bpress(XEvent *);
 static void kpress(XEvent *);
 
 // X event type -> handler; unlisted events are ignored
-static void (*handler[LASTEvent]) (XEvent *) = {
-  [Expose] = expose,
-  [ConfigureNotify] = configure,
-  [ButtonPress] = bpress,
-  [KeyPress] = kpress,
+static void (*handler[LASTEvent])(XEvent *) = {
+    [Expose] = expose,
+    [ConfigureNotify] = configure,
+    [ButtonPress] = bpress,
+    [KeyPress] = kpress,
 };
 
 void create_window() {
@@ -54,7 +52,7 @@ void create_window() {
     // background)
     main_window =
         XCreateSimpleWindow(main_display, root_window, 0, 0, SCREEN_WIDTH,
-                            SCREEN_HEIGHT, 0, 0, BG_COLOR);
+                            SCREEN_HEIGHT, 0, 0, screen_default_bg());
     XSizeHints *hints = XAllocSizeHints();
     hints->flags = PMinSize | PMaxSize;
     hints->min_width = 400;
@@ -87,27 +85,16 @@ void create_window() {
       main_display, main_window, 780, 0, 20, SCREEN_HEIGHT, 0, 0, 0x00808080);
     */
 
-    /**************
-     * text
-     **************/
-    main_font =
-        XftFontOpenName(main_display, DefaultScreen(main_display), font);
-    if (main_font == NULL) {
-      fprintf(stderr, "Error: cannot load font '%s'\n", font);
-      exit(1);
-    }
-    // GC still fills backgrounds and the cursor block; Xft draws the glyphs
+    // GC fills cell backgrounds, underlines, and the cursor block; Xft draws
+    // glyphs
     main_gc = XCreateGC(main_display, main_window, 0, NULL);
 
     /***************
      * display
      ****************/
-    // basically show the windows
     XMapWindow(main_display, main_window);
-    // XMapWindow(main_display, main_scrollbar.win);
-    // flush all data now. Generally not needed after having event loop
     XFlush(main_display);
-    screen_init(main_display, main_window, text_cursor, main_gc, main_font);
+    screen_init(main_display, main_window, text_cursor, main_gc);
   }
 }
 
@@ -197,6 +184,8 @@ static void kpress(XEvent *e) {
 }
 
 int main() {
+  // enable UTF-8 locale so wcwidth() knows wide/combining codepoints
+  setlocale(LC_CTYPE, "");
   create_window();
   XSelectInput(main_display, main_window,
                ExposureMask | KeyPressMask | ButtonPressMask |
